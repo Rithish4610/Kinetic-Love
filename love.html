@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Hand Particle System with Love Gesture</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { margin: 0; overflow: hidden; background: #050505; font-family: sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        #video-feed { 
+            position: absolute; top: 10px; left: 10px; width: 160px; height: 120px; 
+            transform: scaleX(-1); border: 2px solid #333; opacity: 0.5; z-index: 10; border-radius: 8px; object-fit: cover;
+        }
+        #ui {
+            position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+            color: white; text-align: center; pointer-events: none; user-select: none; z-index: 10;
+        }
+        h1 { margin: 0; font-size: 1.2rem; letter-spacing: 2px; text-transform: uppercase; }
+        p { font-size: 0.9rem; color: #aaa; margin-top: 5px; }
+        .highlight { color: #00ffcc; font-weight: bold; }
+        .heart-mode { color: #ff0055; font-weight: bold; }
+        
+        #loading { 
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
+            color: white; font-size: 1.5rem; z-index: 20; background: rgba(0,0,0,0.8); padding: 20px; border-radius: 10px;
+        }
+
+        /* --- NEW: Floating Love Text Styles --- */
+        #love-text {
+            position: absolute;
+            top: 40%;
+            left: 50%;
+            transform: translate(-50%, -50%) scale(0); /* Start hidden/tiny */
+            color: #ff0066;
+            font-family: 'Arial Black', sans-serif;
+            font-size: 5rem;
+            text-shadow: 0 0 20px #ff0066, 0 0 40px #ff99cc;
+            white-space: nowrap;
+            pointer-events: none;
+            z-index: 15;
+            opacity: 0;
+            transition: opacity 0.3s ease-out, transform 0.3s ease-out;
+        }
+
+        /* Class added when gesture detected */
+        #love-text.active {
+            opacity: 1;
+            /* Combine scale animation with continuous floating */
+            animation: growIn 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards, float 2s ease-in-out infinite alternate;
+        }
+
+        @keyframes growIn {
+            0% { transform: translate(-50%, -50%) scale(0.1); }
+            100% { transform: translate(-50%, -50%) scale(1); }
+        }
+
+        @keyframes float {
+            0% { margin-top: 0px; }
+            100% { margin-top: -30px; }
+        }
+    </style>
+</head>
+<body>
+
+<div id="loading">Starting Camera... (Please Allow Access)</div>
+<video id="video-feed" playsinline></video>
+<div id="canvas-container"></div>
+
+<div id="love-text">I LOVE YOU</div>
+
+<div id="ui">
+    <h1>Particle Controller</h1>
+    <p>🖐 Open Hand: <span class="highlight">Expand / Gold</span></p>
+    <p>🫰 Pinch Index & Thumb: <span class="heart-mode">Particle Heart</span></p>
+    <p>🫶 Two Hands Together: <span class="heart-mode">Big Love</span></p>
+</div>
+
+<script>
+    // --- 1. THREE.JS SETUP ---
+    const container = document.getElementById('canvas-container');
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x050505, 0.02);
+
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 30;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    container.appendChild(renderer.domElement);
+
+    // --- 2. PARTICLE SYSTEM DATA ---
+    const PARTICLE_COUNT = 3000;
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(PARTICLE_COUNT * 3);
+    const targetPositions = new Float32Array(PARTICLE_COUNT * 3);
+    const colors = new Float32Array(PARTICLE_COUNT * 3);
+    const randoms = new Float32Array(PARTICLE_COUNT);
+
+    const colorObj = new THREE.Color();
+    
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        positions[i * 3] = (Math.random() - 0.5) * 50;
+        positions[i * 3 + 1] = (Math.random() - 0.5) * 50;
+        positions[i * 3 + 2] = (Math.random() - 0.5) * 50;
+        randoms[i] = Math.random();
+    }
+
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+    const material = new THREE.PointsMaterial({
+        size: 0.4,
+        vertexColors: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        transparent: true,
+        opacity: 0.8
+    });
+
+    const particles = new THREE.Points(geometry, material);
+    scene.add(particles);
+
+    // --- 3. STATE & LOGIC ---
+    const state = {
+        detected: false,
+        x: 0, y: 0,
+        gesture: 'idle', // idle, open, pinch
+        hue: 0.6,
+        showingLoveText: false
+    };
+
+    // Shape Math: Sphere
+    function setSphereTarget(i, tx, ty) {
+        const r = 10 + randoms[i] * 5;
+        const theta = randoms[i] * Math.PI * 2 * 15; 
+        const phi = Math.acos(2 * (randoms[PARTICLE_COUNT - 1 - i]) - 1);
+        targetPositions[i*3] = tx + r * Math.sin(phi) * Math.cos(theta);
+        targetPositions[i*3+1] = ty + r * Math.sin(phi) * Math.sin(theta);
+        targetPositions[i*3+2] = r * Math.cos(phi);
+    }
+
+    // Shape Math: Heart
+    function setHeartTarget(i, tx, ty) {
+        const t = (i / PARTICLE_COUNT) * Math.PI * 2 * 10; 
+        let x = 16 * Math.pow(Math.sin(t), 3);
+        let y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+        let z = (randoms[i] - 0.5) * 10; 
+        const scale = 0.5;
+        targetPositions[i*3] = tx + x * scale;
+        targetPositions[i*3+1] = ty + y * scale;
+        targetPositions[i*3+2] = z;
+    }
+
+    // Main Animation Loop
+    const clock = new THREE.Clock();
+    const loveTextElement = document.getElementById('love-text');
+    
+    function animate() {
+        requestAnimationFrame(animate);
+        const time = clock.getElapsedTime();
+        
+        // 1. Handle Text Visibility based on state
+        if (state.showingLoveText && !loveTextElement.classList.contains('active')) {
+            loveTextElement.classList.add('active');
+        } else if (!state.showingLoveText && loveTextElement.classList.contains('active')) {
+            loveTextElement.classList.remove('active');
+        }
+
+        // 2. Determine Color & Targets based on State
+        let targetHue = 0.6; // Blue
+        // If showing love text, prioritize pink color for particles too
+        if (state.gesture === 'pinch' || state.showingLoveText) targetHue = 0.0; // Red/Pink
+        else if (state.gesture === 'open') targetHue = 0.12; // Gold
+
+        // Lerp color
+        state.hue += (targetHue - state.hue) * 0.05;
+        colorObj.setHSL(state.hue, 1.0, 0.5);
+
+        // 3. Update Particles
+        const posAttr = geometry.attributes.position;
+        const colAttr = geometry.attributes.color;
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            // Calculate Target based on current mode
+            if (state.gesture === 'pinch') {
+                setHeartTarget(i, state.x, state.y);
+            } else {
+                setSphereTarget(i, state.x, state.y);
+            }
+
+            let tx = targetPositions[i*3];
+            let ty = targetPositions[i*3+1];
+            let tz = targetPositions[i*3+2];
+
+            // Expand if open hand
+            if (state.gesture === 'open') {
+                tx = (tx - state.x) * 2.0 + state.x;
+                ty = (ty - state.y) * 2.0 + state.y;
+                tz *= 2.0;
+            }
+
+            // Move particles (Lerp)
+            posAttr.array[i*3]   += (tx - posAttr.array[i*3]) * 0.08;
+            posAttr.array[i*3+1] += (ty - posAttr.array[i*3+1]) * 0.08;
+            posAttr.array[i*3+2] += (tz - posAttr.array[i*3+2]) * 0.08;
+
+            // Set Color
+            colAttr.setXYZ(i, colorObj.r, colorObj.g, colorObj.b);
+        }
+
+        posAttr.needsUpdate = true;
+        colAttr.needsUpdate = true;
+        
+        // Idle rotation
+        if (!state.detected) {
+            particles.rotation.y = time * 0.2;
+            state.x += (0 - state.x) * 0.1;
+            state.y += (0 - state.y) * 0.1;
+        } else {
+             particles.rotation.y += (0 - particles.rotation.y) * 0.1;
+        }
+
+        renderer.render(scene, camera);
+    }
+    animate();
+
+    // --- 4. COMPUTER VISION SETUP ---
+    const videoElement = document.getElementById('video-feed');
+    const loadingElement = document.getElementById('loading');
+
+    function onResults(results) {
+        loadingElement.style.display = 'none';
+        state.showingLoveText = false; // Reset default
+
+        // --- NEW: Detect Two Hands (🫶 gesture) ---
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length === 2) {
+            const hand1Wrist = results.multiHandLandmarks[0][0];
+            const hand2Wrist = results.multiHandLandmarks[1][0];
+            
+            // Calculate distance between wrists (screen coordinates 0.0 - 1.0)
+            const wristDistance = Math.hypot(hand1Wrist.x - hand2Wrist.x, hand1Wrist.y - hand2Wrist.y);
+            
+            // If wrists are very close, assume the two-hand heart gesture
+            if (wristDistance < 0.15) {
+                state.showingLoveText = true;
+            }
+        }
+
+        // --- Existing Single Hand Logic (Particles) ---
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            state.detected = true;
+            // Use the first detected hand for particle control
+            const lm = results.multiHandLandmarks[0];
+
+            // Screen mapping
+            const rawX = 1 - lm[9].x; // Mirror horizontal
+            const rawY = 1 - lm[9].y; // Flip vertical
+            state.x = (rawX - 0.5) * 60;
+            state.y = (rawY - 0.5) * 40;
+
+            // Detect Single Hand Gestures
+            const thumbTip = lm[4];
+            const indexTip = lm[8];
+            const distance = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
+
+            if (distance < 0.05) {
+                state.gesture = 'pinch'; 
+            } else if (distance > 0.2) {
+                state.gesture = 'open'; 
+            } else {
+                state.gesture = 'idle'; 
+            }
+
+        } else {
+            state.detected = false;
+        }
+    }
+
+    // Initialize MediaPipe Hands
+    const hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+    
+    hands.setOptions({
+        maxNumHands: 2, // UPDATED: Changed to 2 to detect 🫶
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+    
+    hands.onResults(onResults);
+
+    // Start Camera
+    const cameraUtils = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({image: videoElement});
+        },
+        width: 640,
+        height: 480
+    });
+    cameraUtils.start();
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+</script>
+</body>
+</html>
